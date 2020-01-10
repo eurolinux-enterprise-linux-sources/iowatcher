@@ -1,0 +1,295 @@
+commit 51dc0f52ae88dd59c3e00877aa03fc19558f41da
+Author: Andrew Price <anprice@redhat.com>
+Date:   Thu Mar 27 21:59:38 2014 +0000
+
+    Fix up directory trace processing
+    
+    Similar to the fix for spaces in file names in commit 5d845e3, this
+    patch fixes processing of directories with spaces in their names by
+    using posix_spawnp() to run the blkparse command instead of system(). In
+    doing so, combine_blktrace_devs() and match_trace() have been reworked
+    to use a list structure instead of doing a lot of strdup()ing and string
+    appending.
+    
+    Also make sure that trailing slashes are removed from the directory name
+    before attempting to use it as the base of the .dump filename.
+    
+    Update the -t entry in the manpage to mention directory behaviour, too.
+    
+    Signed-off-by: Andrew Price <anprice@redhat.com>
+
+diff --git a/blkparse.c b/blkparse.c
+index d27b547..0c51f14 100644
+--- a/blkparse.c
++++ b/blkparse.c
+@@ -709,81 +709,123 @@ int filter_outliers(struct trace *trace, u64 min_offset, u64 max_offset,
+ }
+ 
+ static char footer[] = ".blktrace.0";
+-static int footer_len = sizeof(footer);
++static int footer_len = sizeof(footer) - 1;
+ 
+-static void match_trace(char *name, char **traces)
++static int match_trace(char *name, int *len)
+ {
+ 	int match_len;
+-	char *match;
+ 	int footer_start;
+ 
+ 	match_len = strlen(name);
+ 	if (match_len <= footer_len)
+-		return;
++		return 0;
+ 
+ 	footer_start = match_len - footer_len;
+-	if (strcmp(name + footer_start + 1, footer) != 0)
+-		return;
+-
+-	match = strdup(name);
+-	if (!match)
+-		goto enomem;
+-
+-	match[footer_start + 1] = '\0';
+-	snprintf(line, line_len, "%s -i '%s'", *traces ? *traces : "", match);
+-	free(match);
+-
+-	match = strdup(line);
+-	if (!match)
+-		goto enomem;
+-
+-	free(*traces);
+-	*traces = match;
+-	return;
++	if (strcmp(name + footer_start, footer) != 0)
++		return 0;
+ 
+-enomem:
+-	perror("memory allocation failed");
+-	exit(1);
+-	return;
++	if (len)
++		*len = match_len;
++	return 1;
+ }
+ 
+-static char *combine_blktrace_devs(char *dir_name)
+-{
+-	DIR *dir;
+-	char *traces = NULL;
+-	struct dirent *d;
+-	int len;
+-	int ret;
++struct tracelist {
++	struct tracelist *next;
++	char *name;
++};
+ 
+-	dir = opendir(dir_name);
++static struct tracelist *traces_list(char *dir_name, int *len)
++{
++	int count = 0;
++	struct tracelist *traces = NULL;
++	DIR *dir = opendir(dir_name);
+ 	if (!dir)
+ 		return NULL;
+ 
+ 	while (1) {
+-		d = readdir(dir);
++		int len;
++		struct tracelist *tl;
++		struct dirent *d = readdir(dir);
+ 		if (!d)
+ 			break;
+ 
+-		len = strlen(d->d_name);
+-		if (len > footer_len)
+-			match_trace(d->d_name, &traces);
++		if (!match_trace(d->d_name, &len))
++			continue;
++
++		/* Allocate space for tracelist + filename */
++		tl = calloc(1, sizeof(struct tracelist) + (sizeof(char) * (len + 1)));
++		if (!tl)
++			return NULL;
++		tl->next = traces;
++		tl->name = (char *)(tl + 1);
++		strncpy(tl->name, d->d_name, len);
++		traces = tl;
++		count++;
+ 	}
+ 
+ 	closedir(dir);
+ 
++	if (len)
++		*len = count;
++
++	return traces;
++}
++
++static void traces_free(struct tracelist *traces)
++{
++	while (traces) {
++		struct tracelist *tl = traces;
++		traces = traces->next;
++		free(tl);
++	}
++}
++
++static char *combine_blktrace_devs(char *dir_name)
++{
++	struct tracelist *traces = NULL;
++	struct tracelist *tl;
++	char *ret = NULL;
++	char **argv = NULL;
++	char *dumpfile;
++	int argc = 0;
++	int i;
++	int err;
++
++	if (!asprintf(&dumpfile, "%s.dump", dir_name))
++		goto out;
++
++	traces = traces_list(dir_name, &argc);
+ 	if (!traces)
+-		return NULL;
++		goto out;
+ 
+-	snprintf(line, line_len, "blkparse -O %s -D %s -d '%s.%s'",
+-		 traces, dir_name, dir_name, "dump");
++	argc *= 2; /* {"-i", trace } */
++	argc += 6; /* See below */
++	argv = calloc(argc + 1, sizeof(char *));
++	if (!argv)
++		goto out;
++
++	i = 0;
++	argv[i++] = "blkparse";
++	argv[i++] = "-O";
++	argv[i++] = "-D";
++	argv[i++] = dir_name;
++	argv[i++] = "-d";
++	argv[i++] = dumpfile;
++	for (tl = traces; tl != NULL; tl = tl->next) {
++		argv[i++] = "-i";
++		argv[i++] = tl->name;
++	}
+ 
+-	ret = system(line);
+-	if (ret) {
+-		fprintf(stderr, "blkparse failure %s\n", line);
++	err = run_program2(argc, argv);
++	free(argv);
++	if (err) {
++		fprintf(stderr, "blkparse failed with exit code %d\n", err);
+ 		exit(1);
+ 	}
+-	snprintf(line, line_len, "%s.%s", dir_name, "dump");
+-	return strdup(line);
++	ret = dumpfile;
++out:
++	traces_free(traces);
++	return ret;
+ }
+ 
+ static char *find_trace_file(char *filename)
+@@ -808,6 +850,13 @@ static char *find_trace_file(char *filename)
+ 			found_dir = 1;
+ 	}
+ 
++	if (found_dir) {
++		int i;
++		/* Eat up trailing '/'s */
++		for (i = strlen(filename) - 1; filename[i] == '/'; i--)
++			filename[i] = '\0';
++	}
++
+ 	/*
+ 	 * try tacking .dump onto the end and see if that already
+ 	 * has been generated
+diff --git a/iowatcher.1 b/iowatcher.1
+index 5951c7b..8a06126 100644
+--- a/iowatcher.1
++++ b/iowatcher.1
+@@ -27,9 +27,10 @@ Program to run while blktrace is run.
+ \fB-K, --keep-movie-svgs\fP
+ Keep the SVG files generated for movie mode.
+ .TP
+-\fB-t, --trace\fP <file>
++\fB-t, --trace\fP <file|directory>
+ Controls the name of the blktrace file.  iowatcher uses a dump from blkparse, so -t tries to guess the name of the corresponding per CPU blktrace data files if the dump file doesn't already exist.
+ If you want more than one trace in a given graph, you can specify -t more than once.
++If a directory is specified, iowatcher will use the name of the directory as the base name of the dump file and all trace files found inside the directory will be processed.
+ .TP
+ \fB-l, --label\fP <label>
+ Sets a label in the graph for a trace file.  The labels are added in the same order the trace files are added.
+diff --git a/tracers.c b/tracers.c
+index e78ecc4..8f96372 100644
+--- a/tracers.c
++++ b/tracers.c
+@@ -178,6 +178,26 @@ int run_program(char *str)
+ 	return 0;
+ }
+ 
++int run_program2(int argc, char **argv)
++{
++	int i;
++	int err;
++	pid_t pid;
++
++	fprintf(stderr, "running");
++	for (i = 0; i < argc; i++)
++		fprintf(stderr, " '%s'", argv[i]);
++	fprintf(stderr, "\n");
++
++	err = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
++	if (err != 0) {
++		fprintf(stderr, "%s failed with exit code %d\n", argv[0], err);
++		return err;
++	}
++	waitpid(pid, NULL, 0);
++	return 0;
++}
++
+ int wait_for_tracers(void)
+ {
+ 	int status = 0;
+@@ -194,9 +214,6 @@ int wait_for_tracers(void)
+ 
+ int blktrace_to_dump(char *trace_name)
+ {
+-	pid_t pid;
+-	int err;
+-	int i;
+ 	char *argv[] = {
+ 		"blkparse", "-O",
+ 		"-i", NULL,
+@@ -208,16 +225,7 @@ int blktrace_to_dump(char *trace_name)
+ 	snprintf(line, line_len, "%s.dump", trace_name);
+ 	argv[5] = line;
+ 
+-	fprintf(stderr, "running blkparse");
+-	for (i = 0; i < 6; i++)
+-		fprintf(stderr, " %s", argv[i]);
+-	fprintf(stderr, "\n");
+-
+-	err = posix_spawnp(&pid, "blkparse", NULL, NULL, argv, environ);
+-	if (err != 0)
+-		return err;
+-	waitpid(pid, NULL, 0);
+-	return 0;
++	return run_program2(6, argv);
+ }
+ 
+ int start_mpstat(char *trace_name)
+diff --git a/tracers.h b/tracers.h
+index 91e57f4..48eec45 100644
+--- a/tracers.h
++++ b/tracers.h
+@@ -18,6 +18,7 @@
+ #ifndef __IOWATCH_TRACERS
+ #define __IOWATCH_TRACERS
+ int run_program(char *str);
++int run_program2(int argc, char **argv);
+ int stop_blktrace(void);
+ int start_blktrace(char **devices, int num_devices, char *trace_name, char *dest);
+ int start_mpstat(char *trace_name);

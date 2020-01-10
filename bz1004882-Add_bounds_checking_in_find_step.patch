@@ -1,0 +1,33 @@
+commit 06e44f589d72ddf4a9311d7cc3609a93b0e0f78d
+Author: Andrew Price <anprice@redhat.com>
+Date:   Wed Nov 6 16:11:18 2013 +0000
+
+    Add bounds checking in find_step
+    
+    Check the value of cur_mini_step is sane before using it as an index to
+    mini_step array.
+    
+    rhbz#1004882
+    
+    Signed-off-by: Andrew Price <anprice@redhat.com>
+
+diff --git a/plot.c b/plot.c
+index 971a253..d486f29 100644
+--- a/plot.c
++++ b/plot.c
+@@ -530,10 +530,12 @@ static double find_step(double first, double last, int num_ticks)
+ 	/* Round to power of 10 */
+ 	step = exp(floor(log(step) / log10) * log10);
+ 	/* Scale down step to provide enough ticks */
+-	while ((last - first) / (step * mini_step[cur_mini_step]) > num_ticks
+-	       && cur_mini_step < TICK_MINI_STEPS)
++	while (cur_mini_step < TICK_MINI_STEPS
++	       && (last - first) / (step * mini_step[cur_mini_step]) > num_ticks)
+ 		cur_mini_step++;
+-	step *= mini_step[cur_mini_step - 1];
++
++	if (cur_mini_step > 0)
++		step *= mini_step[cur_mini_step - 1];
+ 
+ 	return step;
+ }

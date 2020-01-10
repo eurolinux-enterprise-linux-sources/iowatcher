@@ -1,0 +1,70 @@
+commit 3f3f551c6c751848dab34c19e7fdcfb286a095f8
+Author: Andrew Price <anprice@redhat.com>
+Date:   Fri Nov 8 10:06:54 2013 +0000
+
+    Fix processing of trace filenames containing spaces
+    
+    blktrace_to_dump passes filenames containing spaces to blkparse via
+    system() so only the first chunk of the string is taken to be the
+    filename by the subprocess.
+    
+    This switches to using posix_spawnp() so that we can present the
+    filename as an element of argv and avoid iowatcher failing in these
+    cases.
+    
+    rhbz#1004865
+    
+    Signed-off-by: Andrew Price <anprice@redhat.com>
+
+diff --git a/tracers.c b/tracers.c
+index d70c4a6..e78ecc4 100644
+--- a/tracers.c
++++ b/tracers.c
+@@ -31,11 +31,14 @@
+ #include <time.h>
+ #include <signal.h>
+ #include <sys/wait.h>
++#include <spawn.h>
+ 
+ #include "plot.h"
+ #include "blkparse.h"
+ #include "list.h"
+ 
++extern char **environ;
++
+ static int line_len = 1024;
+ static char line[1024];
+ 
+@@ -191,10 +194,29 @@ int wait_for_tracers(void)
+ 
+ int blktrace_to_dump(char *trace_name)
+ {
+-	snprintf(line, line_len, "blkparse -O -i %s -d '%s.%s'",
+-		trace_name, trace_name, "dump");
++	pid_t pid;
++	int err;
++	int i;
++	char *argv[] = {
++		"blkparse", "-O",
++		"-i", NULL,
++		"-d", NULL,
++		NULL
++	};
++
++	argv[3] = trace_name;
++	snprintf(line, line_len, "%s.dump", trace_name);
++	argv[5] = line;
++
++	fprintf(stderr, "running blkparse");
++	for (i = 0; i < 6; i++)
++		fprintf(stderr, " %s", argv[i]);
++	fprintf(stderr, "\n");
+ 
+-	system(line);
++	err = posix_spawnp(&pid, "blkparse", NULL, NULL, argv, environ);
++	if (err != 0)
++		return err;
++	waitpid(pid, NULL, 0);
+ 	return 0;
+ }
+ 
